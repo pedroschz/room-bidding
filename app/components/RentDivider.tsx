@@ -1,0 +1,655 @@
+"use client";
+
+import { useState, useCallback, useMemo, useEffect } from "react";
+import Image from "next/image";
+import { solveRentDivision, AllocationResult } from "@/app/lib/algorithm";
+import { NUM_ROOMS, TOTAL_RENT, ROOM_NAMES, ROOM_PHOTOS, DEFAULT_NAMES } from "@/app/lib/constants";
+
+// ─── Lightbox ─────────────────────────────────────────────────────────────────
+
+function Lightbox({ src, label, onClose }: { src: string; label: string; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/90 flex flex-col items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="relative max-w-4xl w-full max-h-[85vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <Image
+          src={src}
+          alt={label}
+          width={1200}
+          height={800}
+          className="w-full h-full object-contain max-h-[80vh]"
+          priority
+        />
+        <div className="flex items-center justify-between mt-3">
+          <span className="text-white/60 text-xs font-mono">{label}</span>
+          <button
+            onClick={onClose}
+            className="text-white/60 text-xs font-mono hover:text-white transition-colors"
+          >
+            close [esc]
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type Phase = "setup" | "input" | "results";
+
+function fmt(n: number) {
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 });
+}
+
+function makeEmptyMatrix(): string[][] {
+  return Array.from({ length: NUM_ROOMS }, () => Array.from({ length: NUM_ROOMS }, () => ""));
+}
+
+function columnSum(matrix: string[][], col: number): number {
+  return matrix.reduce((sum, row) => {
+    const v = parseFloat(row[col]);
+    return sum + (isNaN(v) ? 0 : v);
+  }, 0);
+}
+
+// ─── Landing ──────────────────────────────────────────────────────────────────
+
+function Landing({ onStart }: { onStart: () => void }) {
+  return (
+    <div className="min-h-screen bg-white flex flex-col items-center justify-center px-6">
+      <div className="max-w-lg w-full space-y-10">
+        <div className="space-y-3">
+          <p className="text-xs font-mono text-gray-400 tracking-widest uppercase">
+            Game Theory / Envy-Free Algorithm
+          </p>
+          <h1 className="text-6xl font-black text-black tracking-tighter leading-none">
+            Fair Rent<br />Division
+          </h1>
+          <p className="text-gray-500 text-base leading-relaxed max-w-sm">
+            10 roommates bid on 10 rooms within a $6,000/mo budget. The algorithm
+            finds who gets what — and at what price — so nobody wants to swap.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-3 divide-x divide-black border border-black">
+          {[
+            { label: "Rooms", value: "10" },
+            { label: "People", value: "10" },
+            { label: "Budget", value: "$6k" },
+          ].map(({ label, value }) => (
+            <div key={label} className="p-4">
+              <p className="text-3xl font-black text-black font-mono">{value}</p>
+              <p className="text-gray-500 text-xs mt-1 uppercase tracking-wide">{label}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="border-l-2 border-black pl-4 space-y-2">
+          {[
+            "Each person rates every room in dollars (must sum to $6,000).",
+            "Hungarian algorithm finds the welfare-maximising assignment.",
+            "LP dual variables set prices — no one envies anyone else's deal.",
+          ].map((step, i) => (
+            <div key={i} className="flex gap-3">
+              <span className="font-mono text-gray-300 text-sm select-none">{i + 1}.</span>
+              <p className="text-gray-600 text-sm">{step}</p>
+            </div>
+          ))}
+        </div>
+
+        <button
+          onClick={onStart}
+          className="w-full bg-black text-white font-bold py-4 text-base tracking-wide hover:bg-gray-900 transition-colors"
+        >
+          Start →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Input Phase ──────────────────────────────────────────────────────────────
+
+interface InputPhaseProps {
+  names: string[];
+  setNames: (names: string[]) => void;
+  matrix: string[][];
+  setCell: (room: number, person: number, value: string) => void;
+  onSolve: () => void;
+}
+
+function InputPhase({ names, setNames, matrix, setCell, onSolve }: InputPhaseProps) {
+  const [activePerson, setActivePerson] = useState(0);
+  const [lightbox, setLightbox] = useState<{ src: string; label: string } | null>(null);
+
+  const colSums = useMemo(
+    () => Array.from({ length: NUM_ROOMS }, (_, p) => columnSum(matrix, p)),
+    [matrix]
+  );
+  const colValid = useMemo(
+    () => colSums.map((s) => Math.abs(s - TOTAL_RENT) < 0.01),
+    [colSums]
+  );
+  const allValid = colValid.every(Boolean);
+
+  const updateName = (i: number, val: string) => {
+    const next = [...names];
+    next[i] = val;
+    setNames(next);
+  };
+
+  const autoFill = () => {
+    const vals = matrix.map((row) => {
+      const v = parseFloat(row[activePerson]);
+      return isNaN(v) ? null : v;
+    });
+    const filledSum = vals.reduce<number>((a, v) => a + (v ?? 0), 0);
+    const emptyCount = vals.filter((v) => v === null).length;
+    if (emptyCount === 0) return;
+    const each = Math.round(((TOTAL_RENT - filledSum) / emptyCount) * 100) / 100;
+    vals.forEach((v, room) => {
+      if (v === null) setCell(room, activePerson, String(each));
+    });
+  };
+
+  const remaining = TOTAL_RENT - colSums[activePerson];
+  const isOver = colSums[activePerson] > TOTAL_RENT;
+
+  return (
+    <div className="min-h-screen bg-white">
+      {lightbox && <Lightbox src={lightbox.src} label={lightbox.label} onClose={() => setLightbox(null)} />}
+
+      {/* Header */}
+      <header className="sticky top-0 z-20 bg-white border-b border-black px-4 py-3">
+        <div className="max-w-2xl mx-auto flex items-center justify-between gap-4">
+          <span className="font-black text-black text-sm tracking-tight">Fair Rent Division</span>
+
+          {/* Person tabs */}
+          <div className="flex gap-1 flex-wrap">
+            {Array.from({ length: NUM_ROOMS }, (_, i) => (
+              <button
+                key={i}
+                onClick={() => setActivePerson(i)}
+                className={`relative px-2.5 py-1 text-xs font-mono font-bold border transition-colors ${
+                  i === activePerson
+                    ? "bg-black text-white border-black"
+                    : "bg-white text-gray-500 border-gray-300 hover:border-black hover:text-black"
+                }`}
+              >
+                {i + 1}
+                {colValid[i] && (
+                  <span className="absolute -top-1 -right-1 w-2 h-2 bg-black rounded-full" />
+                )}
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={onSolve}
+            disabled={!allValid}
+            className={`px-4 py-2 text-xs font-bold border transition-colors ${
+              allValid
+                ? "bg-black text-white border-black hover:bg-gray-900"
+                : "bg-white text-gray-300 border-gray-200 cursor-not-allowed"
+            }`}
+          >
+            {allValid ? "Solve →" : `${colValid.filter(Boolean).length}/10`}
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-2xl mx-auto px-4 pt-6 pb-24 space-y-5">
+        {/* Person header */}
+        <div className="flex items-end justify-between border-b-2 border-black pb-3">
+          <div>
+            <p className="text-xs text-gray-400 font-mono uppercase tracking-widest mb-1">
+              Person {activePerson + 1} of {NUM_ROOMS} (ONLY FILL IN YOUR NAME)
+            </p>
+            <input
+              className="text-2xl font-black text-black bg-transparent outline-none border-b-2 border-transparent focus:border-black w-48 placeholder-gray-300"
+              value={names[activePerson]}
+              onChange={(e) => updateName(activePerson, e.target.value)}
+              placeholder={`Person ${activePerson + 1}`}
+              maxLength={20}
+            />
+          </div>
+          <div className="text-right">
+            <p className={`text-2xl font-black font-mono ${colValid[activePerson] ? "text-black" : isOver ? "text-black" : "text-gray-400"}`}>
+              {fmt(colSums[activePerson])}
+            </p>
+            <p className="text-xs text-gray-400 font-mono">
+              {colValid[activePerson]
+                ? "✓ ready"
+                : isOver
+                ? `${fmt(Math.abs(remaining))} over`
+                : `${fmt(remaining)} left`}
+            </p>
+          </div>
+        </div>
+
+        {/* Progress bar */}
+        <div className="h-0.5 bg-gray-100">
+          <div
+            className="h-full bg-black transition-all duration-200"
+            style={{ width: `${Math.min((colSums[activePerson] / TOTAL_RENT) * 100, 100)}%` }}
+          />
+        </div>
+
+        {/* Room inputs */}
+        <div className="space-y-1">
+          {ROOM_NAMES.map((roomName, room) => {
+            const val = matrix[room][activePerson];
+            const num = parseFloat(val);
+            const hasVal = !isNaN(num) && val !== "";
+            const photo = ROOM_PHOTOS[room];
+            return (
+              <div key={room} className={`flex items-center gap-3 border-b py-2 ${hasVal ? "border-black" : "border-gray-100"}`}>
+                {/* Room thumbnail */}
+                <div className="w-12 h-9 flex-shrink-0 bg-gray-100 overflow-hidden">
+                  {photo ? (
+                    <button
+                      type="button"
+                      onClick={() => setLightbox({ src: photo, label: roomName })}
+                      className="w-full h-full block group relative"
+                    >
+                      <Image
+                        src={photo}
+                        alt={roomName}
+                        width={48}
+                        height={36}
+                        className="w-full h-full object-cover group-hover:opacity-70 transition-opacity"
+                      />
+                      <span className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-white text-[9px] font-mono">
+                        ⤢
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center">
+                      <span className="text-gray-300 text-xs font-mono">—</span>
+                    </div>
+                  )}
+                </div>
+
+                <span className="text-xs font-mono text-gray-400 w-12 flex-shrink-0">
+                  {roomName.replace("Room ", "R")}
+                </span>
+
+                <div className="flex-1 relative">
+                  <span className="absolute left-0 top-1/2 -translate-y-1/2 text-gray-400 text-sm font-mono">$</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={val}
+                    onChange={(e) => setCell(room, activePerson, e.target.value)}
+                    placeholder="0"
+                    className="w-full bg-transparent pl-4 text-black text-sm font-mono outline-none placeholder-gray-200"
+                  />
+                </div>
+
+                {hasVal && (
+                  <span className="text-xs font-mono text-gray-400 w-10 text-right flex-shrink-0">
+                    {((num / TOTAL_RENT) * 100).toFixed(0)}%
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Actions */}
+        <div className="flex gap-3 pt-1">
+          <button
+            onClick={autoFill}
+            className="flex-1 py-2.5 text-xs font-bold border border-black text-black hover:bg-black hover:text-white transition-colors"
+          >
+            Auto-fill remaining
+          </button>
+          <button
+            onClick={() => Array.from({ length: NUM_ROOMS }, (_, room) => setCell(room, activePerson, ""))}
+            className="px-5 py-2.5 text-xs font-bold border border-gray-200 text-gray-400 hover:border-black hover:text-black transition-colors"
+          >
+            Clear
+          </button>
+        </div>
+
+        {/* Prev / Next */}
+        <div className="flex justify-between pt-2">
+          <button
+            onClick={() => setActivePerson((p) => Math.max(0, p - 1))}
+            disabled={activePerson === 0}
+            className="text-xs font-mono text-gray-400 disabled:opacity-20 hover:text-black transition-colors"
+          >
+            ← prev
+          </button>
+          <button
+            onClick={() => setActivePerson((p) => Math.min(NUM_ROOMS - 1, p + 1))}
+            disabled={activePerson === NUM_ROOMS - 1}
+            className="text-xs font-mono text-gray-400 disabled:opacity-20 hover:text-black transition-colors"
+          >
+            next →
+          </button>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+// ─── Results Phase ────────────────────────────────────────────────────────────
+
+interface ResultsPhaseProps {
+  result: AllocationResult;
+  names: string[];
+  valuations: number[][];
+  onReset: () => void;
+}
+
+function ResultsPhase({ result, names, valuations, onReset }: ResultsPhaseProps) {
+  const { assignment, prices, surpluses, totalRent, isEnvyFree } = result;
+  const [showMatrix, setShowMatrix] = useState(false);
+  const [lightbox, setLightbox] = useState<{ src: string; label: string } | null>(null);
+
+  const priceSum = Math.round(prices.reduce((a, b) => a + b, 0) * 100) / 100;
+
+  const roomToPerson = useMemo(() => {
+    const m = new Array(NUM_ROOMS).fill(-1);
+    assignment.forEach((room, person) => (m[room] = person));
+    return m;
+  }, [assignment]);
+
+  return (
+    <div className="min-h-screen bg-white">
+      {lightbox && <Lightbox src={lightbox.src} label={lightbox.label} onClose={() => setLightbox(null)} />}
+
+      {/* Header */}
+      <header className="sticky top-0 z-20 bg-white border-b border-black px-4 py-3">
+        <div className="max-w-6xl mx-auto flex items-center justify-between">
+          <span className="font-black text-black text-sm tracking-tight">Results</span>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowMatrix(!showMatrix)}
+              className="px-3 py-1.5 text-xs font-bold border border-gray-200 text-gray-500 hover:border-black hover:text-black transition-colors"
+            >
+              {showMatrix ? "Hide" : "Show"} full matrix
+            </button>
+            <button
+              onClick={onReset}
+              className="px-3 py-1.5 text-xs font-bold border border-black text-black hover:bg-black hover:text-white transition-colors"
+            >
+              Start over
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-4 pt-6 pb-16 space-y-8">
+
+        {/* Verdict */}
+        <div className={`border-l-4 ${isEnvyFree ? "border-black" : "border-gray-400"} pl-4 py-1`}>
+          <p className="font-black text-black text-lg">
+            {isEnvyFree ? "Envy-Free" : "Approximate"} Solution
+          </p>
+          <p className="text-gray-500 text-sm">
+            {isEnvyFree
+              ? "No roommate prefers anyone else's (room, price) pair."
+              : "Rounding introduced differences under $0.01."}
+          </p>
+        </div>
+
+        {/* Summary stats */}
+        <div className="grid grid-cols-3 divide-x divide-black border border-black">
+          <div className="p-4">
+            <p className="text-xs font-mono text-gray-400 uppercase tracking-widest mb-1">Total rent</p>
+            <p className="text-2xl font-black font-mono text-black">{fmt(totalRent)}</p>
+          </div>
+          <div className="p-4">
+            <p className="text-xs font-mono text-gray-400 uppercase tracking-widest mb-1">Prices sum</p>
+            <p className={`text-2xl font-black font-mono ${Math.abs(priceSum - totalRent) < 0.02 ? "text-black" : "text-gray-400"}`}>
+              {fmt(priceSum)}
+            </p>
+          </div>
+          <div className="p-4">
+            <p className="text-xs font-mono text-gray-400 uppercase tracking-widest mb-1">Balanced</p>
+            <p className="text-2xl font-black text-black">
+              {Math.abs(priceSum - totalRent) < 0.02 ? "Yes" : "No"}
+            </p>
+          </div>
+        </div>
+
+        {/* Assignment cards */}
+        <div>
+          <p className="text-xs font-mono text-gray-400 uppercase tracking-widest mb-3">Assignments</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-px bg-black border border-black">
+            {ROOM_NAMES.map((roomName, room) => {
+              const person = roomToPerson[room];
+              const price = prices[room];
+              const val = valuations[person][room];
+              const surplus = surpluses[person];
+              const photo = ROOM_PHOTOS[room];
+              return (
+                <div key={room} className="bg-white">
+                  {/* Room photo */}
+                  {photo ? (
+                    <button
+                      type="button"
+                      onClick={() => setLightbox({ src: photo, label: roomName })}
+                      className="relative w-full h-36 overflow-hidden block group"
+                    >
+                      <Image
+                        src={photo}
+                        alt={roomName}
+                        fill
+                        className="object-cover group-hover:opacity-80 transition-opacity"
+                        sizes="(max-width: 640px) 100vw, 50vw"
+                      />
+                      <span className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-white text-2xl">
+                        ⤢
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="w-full h-20 bg-gray-50 flex items-center justify-center">
+                      <span className="text-gray-200 text-xs font-mono">no photo</span>
+                    </div>
+                  )}
+
+                  <div className="p-4 space-y-2">
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <p className="text-xs font-mono text-gray-400">{roomName}</p>
+                        <p className="font-black text-black text-lg leading-tight">{names[person]}</p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-xl font-black font-mono text-black">{fmt(price)}</p>
+                        <p className="text-xs font-mono text-gray-400">/mo</p>
+                      </div>
+                    </div>
+                    <div className="flex justify-between text-xs font-mono text-gray-400 pt-1 border-t border-gray-100">
+                      <span>valued {fmt(val)}</span>
+                      <span className={surplus >= 0 ? "text-black" : "text-gray-400"}>
+                        surplus {surplus >= 0 ? "+" : ""}{fmt(surplus)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Envy-freeness table */}
+        <div>
+          <p className="text-xs font-mono text-gray-400 uppercase tracking-widest mb-1">Envy-Freeness Check</p>
+          <p className="text-xs text-gray-400 mb-3">
+            Surplus = valuation − price. Filled cell = assigned room. Each person's assigned surplus is their maximum.
+          </p>
+          <div className="overflow-x-auto border border-black">
+            <table className="w-full text-xs font-mono border-collapse">
+              <thead>
+                <tr className="border-b border-black bg-black text-white">
+                  <th className="text-left py-2 px-3 font-bold">Person</th>
+                  {ROOM_NAMES.map((r) => (
+                    <th key={r} className="py-2 px-2 text-center font-bold">
+                      {r.replace("Room ", "R")}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {Array.from({ length: NUM_ROOMS }, (_, person) => {
+                  const assignedRoom = assignment[person];
+                  const maxSurplus = Math.max(
+                    ...Array.from({ length: NUM_ROOMS }, (_, r) => valuations[person][r] - prices[r])
+                  );
+                  return (
+                    <tr key={person} className="border-t border-gray-100 hover:bg-gray-50">
+                      <td className="py-2 px-3 font-bold text-black whitespace-nowrap">{names[person]}</td>
+                      {Array.from({ length: NUM_ROOMS }, (_, room) => {
+                        const surplus = Math.round((valuations[person][room] - prices[room]) * 100) / 100;
+                        const isAssigned = room === assignedRoom;
+                        const isMax = !isAssigned && Math.abs(surplus - maxSurplus) < 0.02;
+                        return (
+                          <td
+                            key={room}
+                            className={`py-2 px-2 text-center ${
+                              isAssigned
+                                ? "bg-black text-white font-bold"
+                                : isMax
+                                ? "text-black font-semibold"
+                                : "text-gray-300"
+                            }`}
+                          >
+                            {fmt(surplus)}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Full valuation matrix (collapsible) */}
+        {showMatrix && (
+          <div>
+            <p className="text-xs font-mono text-gray-400 uppercase tracking-widest mb-3">
+              Original Valuations
+            </p>
+            <div className="overflow-x-auto border border-black">
+              <table className="w-full text-xs font-mono border-collapse">
+                <thead>
+                  <tr className="border-b border-black bg-black text-white">
+                    <th className="text-left py-2 px-3 font-bold">Room</th>
+                    {names.map((name, i) => (
+                      <th key={i} className="py-2 px-2 text-center font-bold">{name}</th>
+                    ))}
+                    <th className="py-2 px-2 text-center font-bold border-l border-white/20">Price</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ROOM_NAMES.map((roomName, room) => (
+                    <tr key={room} className="border-t border-gray-100 hover:bg-gray-50">
+                      <td className="py-2 px-3 font-bold text-black">{roomName}</td>
+                      {Array.from({ length: NUM_ROOMS }, (_, person) => {
+                        const isAssigned = assignment[person] === room;
+                        return (
+                          <td
+                            key={person}
+                            className={`py-2 px-2 text-center ${isAssigned ? "font-bold text-black" : "text-gray-300"}`}
+                          >
+                            {fmt(valuations[person][room])}
+                          </td>
+                        );
+                      })}
+                      <td className="py-2 px-2 text-center font-bold text-black border-l border-gray-100">
+                        {fmt(prices[room])}
+                      </td>
+                    </tr>
+                  ))}
+                  <tr className="border-t-2 border-black bg-gray-50">
+                    <td className="py-2 px-3 font-bold text-black">Total</td>
+                    {Array.from({ length: NUM_ROOMS }, (_, person) => (
+                      <td key={person} className="py-2 px-2 text-center font-bold text-black">
+                        {fmt(valuations[person].reduce((a, b) => a + b, 0))}
+                      </td>
+                    ))}
+                    <td className="py-2 px-2 text-center font-bold text-black border-l border-gray-200">
+                      {fmt(priceSum)}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+// ─── Root ─────────────────────────────────────────────────────────────────────
+
+export default function RentDivider() {
+  const [phase, setPhase] = useState<Phase>("setup");
+  const [names, setNames] = useState<string[]>([...DEFAULT_NAMES]);
+  const [matrix, setMatrix] = useState<string[][]>(makeEmptyMatrix());
+  const [result, setResult] = useState<AllocationResult | null>(null);
+
+  const setCell = useCallback((room: number, person: number, value: string) => {
+    setMatrix((prev) => {
+      const next = prev.map((row) => [...row]);
+      next[room][person] = value;
+      return next;
+    });
+  }, []);
+
+  const handleSolve = useCallback(() => {
+    const valuations = Array.from({ length: NUM_ROOMS }, (_, person) =>
+      Array.from({ length: NUM_ROOMS }, (_, room) => parseFloat(matrix[room][person]) || 0)
+    );
+    setResult(solveRentDivision(valuations, TOTAL_RENT));
+    setPhase("results");
+  }, [matrix]);
+
+  const handleReset = useCallback(() => {
+    setMatrix(makeEmptyMatrix());
+    setNames([...DEFAULT_NAMES]);
+    setResult(null);
+    setPhase("setup");
+  }, []);
+
+  if (phase === "setup") return <Landing onStart={() => setPhase("input")} />;
+
+  if (phase === "input")
+    return (
+      <InputPhase
+        names={names}
+        setNames={setNames}
+        matrix={matrix}
+        setCell={setCell}
+        onSolve={handleSolve}
+      />
+    );
+
+  if (phase === "results" && result) {
+    const valuations = Array.from({ length: NUM_ROOMS }, (_, person) =>
+      Array.from({ length: NUM_ROOMS }, (_, room) => parseFloat(matrix[room][person]) || 0)
+    );
+    return (
+      <ResultsPhase result={result} names={names} valuations={valuations} onReset={handleReset} />
+    );
+  }
+
+  return null;
+}
