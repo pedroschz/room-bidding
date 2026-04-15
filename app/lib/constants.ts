@@ -21,6 +21,6 @@ export const ROOM_PHOTOS: (string | null)[] = [
 ];
 
 export const DEFAULT_NAMES = [
-  "Alex", "Blake", "Casey", "Drew", "Emery",
-  "Finley", "Gray", "Harper", "Indigo", "Jules",
+  "Malcolm", "Deep", "Pedro", "Ambro", "Daniel",
+  "Will", "Kevin", "Michael/Eli", "Eroll", "Eric",
 ];
