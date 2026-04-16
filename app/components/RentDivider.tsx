@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import Image from "next/image";
 import { solveRentDivision, AllocationResult } from "@/app/lib/algorithm";
 import { NUM_ROOMS, TOTAL_RENT, ROOM_NAMES, ROOM_PHOTOS, DEFAULT_NAMES } from "@/app/lib/constants";
@@ -55,7 +55,7 @@ function Lightbox({ src, label, onClose }: { src: string; label: string; onClose
 
 // ─── Landing ──────────────────────────────────────────────────────────────────
 
-function Landing({ onStart }: { onStart: () => void }) {
+function Landing({ onStart, syncStatus }: { onStart: () => void; syncStatus: "ok" | "syncing" | "offline" }) {
   return (
     <div className="min-h-screen bg-white flex flex-col items-center justify-center px-6">
       <div className="max-w-lg w-full space-y-10">
@@ -106,6 +106,12 @@ function Landing({ onStart }: { onStart: () => void }) {
         >
           Start →
         </button>
+
+        {syncStatus === "offline" && (
+          <p className="text-center text-xs font-mono text-gray-400">
+            Running offline — changes won&apos;t sync across devices.
+          </p>
+        )}
       </div>
     </div>
   );
@@ -118,11 +124,12 @@ interface ChooseProps {
   submitted: boolean[];
   colValid: boolean[];
   colSums: number[];
+  syncStatus: "ok" | "syncing" | "offline";
   onPick: (person: number) => void;
   onRunAlgorithm: () => void;
 }
 
-function ChooseScreen({ names, submitted, colValid, colSums, onPick, onRunAlgorithm }: ChooseProps) {
+function ChooseScreen({ names, submitted, colValid, colSums, syncStatus, onPick, onRunAlgorithm }: ChooseProps) {
   const allSubmitted = submitted.every(Boolean);
   const submittedCount = submitted.filter(Boolean).length;
 
@@ -131,9 +138,12 @@ function ChooseScreen({ names, submitted, colValid, colSums, onPick, onRunAlgori
       <div className="max-w-lg w-full space-y-8">
 
         <div>
-          <p className="text-xs font-mono text-gray-400 uppercase tracking-widest mb-1">
-            {submittedCount}/{NUM_ROOMS} submitted
-          </p>
+          <div className="flex items-center gap-2 mb-1">
+            <p className="text-xs font-mono text-gray-400 uppercase tracking-widest">
+              {submittedCount}/{NUM_ROOMS} submitted
+            </p>
+            <SyncDot status={syncStatus} />
+          </div>
           <h2 className="text-3xl font-black text-black tracking-tight">Who are you?</h2>
           <p className="text-gray-500 text-sm mt-1">Pick your name to enter or edit your bids.</p>
         </div>
@@ -214,6 +224,7 @@ interface InputScreenProps {
   submitted: boolean[];
   colSums: number[];
   colValid: boolean[];
+  syncStatus: "ok" | "syncing" | "offline";
   onSubmit: () => void;
   onBack: () => void;
 }
@@ -227,6 +238,7 @@ function InputScreen({
   submitted,
   colSums,
   colValid,
+  syncStatus,
   onSubmit,
   onBack,
 }: InputScreenProps) {
@@ -263,8 +275,9 @@ function InputScreen({
           <button onClick={onBack} className="text-xs font-mono text-gray-400 hover:text-black transition-colors">
             ← back
           </button>
-          <span className="font-black text-black text-sm">
+          <span className="font-black text-black text-sm flex items-center gap-1.5">
             {names[person] || `Person ${person + 1}`}
+            <SyncDot status={syncStatus} />
           </span>
           <button
             onClick={onSubmit}
@@ -431,10 +444,11 @@ interface ResultsScreenProps {
   result: AllocationResult;
   names: string[];
   valuations: number[][];
+  syncStatus: "ok" | "syncing" | "offline";
   onReset: () => void;
 }
 
-function ResultsScreen({ result, names, valuations, onReset }: ResultsScreenProps) {
+function ResultsScreen({ result, names, valuations, syncStatus, onReset }: ResultsScreenProps) {
   const { assignment, prices, surpluses, totalRent, isEnvyFree } = result;
   const [showMatrix, setShowMatrix] = useState(false);
   const [lightbox, setLightbox] = useState<{ src: string; label: string } | null>(null);
@@ -453,7 +467,10 @@ function ResultsScreen({ result, names, valuations, onReset }: ResultsScreenProp
 
       <header className="sticky top-0 z-20 bg-white border-b border-black px-4 py-3">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
-          <span className="font-black text-black text-sm tracking-tight">Results</span>
+          <span className="font-black text-black text-sm tracking-tight flex items-center gap-1.5">
+            Results
+            <SyncDot status={syncStatus} />
+          </span>
           <div className="flex gap-2">
             <button
               onClick={() => setShowMatrix(!showMatrix)}
@@ -654,57 +671,154 @@ function ResultsScreen({ result, names, valuations, onReset }: ResultsScreenProp
   );
 }
 
-// ─── Persistence ──────────────────────────────────────────────────────────────
+// ─── API helpers ──────────────────────────────────────────────────────────────
 
-const STORAGE_KEY = "rent-division-v1";
+import type { ServerState } from "@/app/api/state/route";
 
-interface PersistedState {
-  phase: Phase;
-  names: string[];
-  matrix: string[][];
-  submitted: boolean[];
-}
-
-function loadState(): PersistedState | null {
-  if (typeof window === "undefined") return null;
+async function fetchRemoteState(): Promise<ServerState | null> {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as PersistedState) : null;
+    const res = await fetch("/api/state", { cache: "no-store" });
+    if (!res.ok) return null;
+    return res.json();
   } catch {
     return null;
   }
 }
 
-function saveState(s: PersistedState) {
+async function postPerson(person: number, name: string, values: string[], submitted: boolean): Promise<ServerState | null> {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+    const res = await fetch("/api/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "person", person, name, values, submitted }),
+    });
+    if (!res.ok) return null;
+    return res.json();
   } catch {
-    // storage full or unavailable — fail silently
+    return null;
   }
 }
 
-function clearState() {
-  try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+async function postResult(result: AllocationResult): Promise<void> {
+  try {
+    await fetch("/api/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "result", result }),
+    });
+  } catch { /* ignore */ }
+}
+
+async function postStart(): Promise<ServerState | null> {
+  try {
+    const res = await fetch("/api/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "start" }),
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function deleteRemoteState(): Promise<void> {
+  try { await fetch("/api/state", { method: "DELETE" }); } catch { /* ignore */ }
+}
+
+// ─── Sync status indicator ────────────────────────────────────────────────────
+
+function SyncDot({ status }: { status: "ok" | "syncing" | "offline" }) {
+  return (
+    <span title={status === "ok" ? "Synced" : status === "syncing" ? "Syncing…" : "Offline — changes saved locally"}>
+      <span className={`inline-block w-1.5 h-1.5 rounded-full ${
+        status === "ok" ? "bg-black" : status === "syncing" ? "bg-gray-400 animate-pulse" : "bg-gray-300"
+      }`} />
+    </span>
+  );
 }
 
 // ─── Root ─────────────────────────────────────────────────────────────────────
 
 export default function RentDivider() {
-  // Initialise from localStorage on first render; "landing" if nothing saved.
-  const [phase, setPhase] = useState<Phase>(() => loadState()?.phase ?? "landing");
-  const [names, setNames] = useState<string[]>(() => loadState()?.names ?? [...DEFAULT_NAMES]);
-  const [matrix, setMatrix] = useState<string[][]>(() => loadState()?.matrix ?? makeEmptyMatrix());
-  const [submitted, setSubmitted] = useState<boolean[]>(() => loadState()?.submitted ?? Array(NUM_ROOMS).fill(false));
-  const [activePerson, setActivePerson] = useState<number | null>(null);
+  // ── Shared state (mirrors what's in Redis) ──
+  const [names, setNames] = useState<string[]>([...DEFAULT_NAMES]);
+  const [matrix, setMatrix] = useState<string[][]>(makeEmptyMatrix());
+  const [submitted, setSubmitted] = useState<boolean[]>(Array(NUM_ROOMS).fill(false));
   const [result, setResult] = useState<AllocationResult | null>(null);
 
-  // Persist whenever relevant state changes (activePerson is ephemeral — always
-  // land on "choose" after a refresh, which is safe).
-  useEffect(() => {
-    const persistPhase: Phase = phase === "input" ? "choose" : phase;
-    saveState({ phase: persistPhase, names, matrix, submitted });
-  }, [phase, names, matrix, submitted]);
+  // ── Local / ephemeral ──
+  const [phase, setPhase] = useState<Phase>("landing");
+  const [activePerson, setActivePerson] = useState<number | null>(null);
+  const [syncStatus, setSyncStatus] = useState<"ok" | "syncing" | "offline">("ok");
 
+  // Ref so debounce callback always closes over the latest activePerson
+  const activePersonRef = useRef<number | null>(null);
+  activePersonRef.current = activePerson;
+
+  // ── Merge remote state into local, skipping the active person's column ──
+  const applyRemote = useCallback((remote: ServerState | null) => {
+    if (!remote) return;
+    const ap = activePersonRef.current;
+    setNames((prev) => prev.map((n, i) => (i === ap ? n : remote.names[i])));
+    setMatrix((prev) =>
+      prev.map((row, room) =>
+        row.map((cell, person) => (person === ap ? cell : remote.matrix[room][person]))
+      )
+    );
+    setSubmitted(remote.submitted);
+    if (remote.result) {
+      setResult(remote.result);
+      setPhase("results");
+    }
+  }, []);
+
+  // ── Bootstrap: fetch once on mount ──
+  useEffect(() => {
+    fetchRemoteState().then((remote) => {
+      if (remote) {
+        applyRemote(remote);
+        setPhase("choose");
+      }
+      // If null → stay on landing (no active session)
+    });
+  }, [applyRemote]);
+
+  // ── Poll every 3 seconds ──
+  useEffect(() => {
+    const id = setInterval(async () => {
+      const remote = await fetchRemoteState();
+      applyRemote(remote);
+    }, 3000);
+    return () => clearInterval(id);
+  }, [applyRemote]);
+
+  // ── Debounced write of the active person's column ──
+  // Fires 1 s after the last keystroke while in input phase.
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const schedulePush = useCallback(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      const ap = activePersonRef.current;
+      if (ap === null) return;
+      setSyncStatus("syncing");
+      setNames((currentNames) => {
+        setMatrix((currentMatrix) => {
+          const values = currentMatrix.map((row) => row[ap]);
+          postPerson(ap, currentNames[ap], values, false).then((remote) => {
+            applyRemote(remote);
+            setSyncStatus(remote ? "ok" : "offline");
+          });
+          return currentMatrix;
+        });
+        return currentNames;
+      });
+    }, 1000);
+  }, [applyRemote]);
+
+  // ── Computed ──
   const colSums = useMemo(
     () => Array.from({ length: NUM_ROOMS }, (_, p) => columnSum(matrix, p)),
     [matrix]
@@ -714,55 +828,100 @@ export default function RentDivider() {
     [colSums]
   );
 
-  const setCell = useCallback((room: number, person: number, value: string) => {
-    setMatrix((prev) => {
-      const next = prev.map((row) => [...row]);
-      next[room][person] = value;
-      return next;
-    });
-  }, []);
+  // ── Actions ──
+  const handleStart = useCallback(async () => {
+    setSyncStatus("syncing");
+    const remote = await postStart();
+    if (remote) {
+      applyRemote(remote);
+      setSyncStatus("ok");
+    } else {
+      setSyncStatus("offline");
+    }
+    setPhase("choose");
+  }, [applyRemote]);
 
   const handlePick = useCallback((person: number) => {
     setActivePerson(person);
     setPhase("input");
   }, []);
 
-  const handleSubmit = useCallback(() => {
-    if (activePerson === null) return;
+  const setCell = useCallback((room: number, person: number, value: string) => {
+    setMatrix((prev) => {
+      const next = prev.map((row) => [...row]);
+      next[room][person] = value;
+      return next;
+    });
+    schedulePush();
+  }, [schedulePush]);
+
+  const handleSetName = useCallback((name: string) => {
+    setNames((prev) => {
+      const next = [...prev];
+      next[activePersonRef.current!] = name;
+      return next;
+    });
+    schedulePush();
+  }, [schedulePush]);
+
+  const handleSubmit = useCallback(async () => {
+    const ap = activePersonRef.current;
+    if (ap === null) return;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    setSyncStatus("syncing");
     setSubmitted((prev) => {
       const next = [...prev];
-      next[activePerson] = true;
+      next[ap] = true;
       return next;
+    });
+    setNames((currentNames) => {
+      setMatrix((currentMatrix) => {
+        const values = currentMatrix.map((row) => row[ap]);
+        postPerson(ap, currentNames[ap], values, true).then((remote) => {
+          applyRemote(remote);
+          setSyncStatus(remote ? "ok" : "offline");
+        });
+        return currentMatrix;
+      });
+      return currentNames;
     });
     setActivePerson(null);
     setPhase("choose");
-  }, [activePerson]);
+  }, [applyRemote]);
 
   const handleBack = useCallback(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
     setActivePerson(null);
     setPhase("choose");
   }, []);
 
-  const handleRunAlgorithm = useCallback(() => {
+  const handleRunAlgorithm = useCallback(async () => {
     const valuations = Array.from({ length: NUM_ROOMS }, (_, person) =>
       Array.from({ length: NUM_ROOMS }, (_, room) => parseFloat(matrix[room][person]) || 0)
     );
-    setResult(solveRentDivision(valuations, TOTAL_RENT));
+    const res = solveRentDivision(valuations, TOTAL_RENT);
+    setResult(res);
     setPhase("results");
+    setSyncStatus("syncing");
+    await postResult(res);
+    setSyncStatus("ok");
   }, [matrix]);
 
-  const handleReset = useCallback(() => {
-    clearState();
+  const handleReset = useCallback(async () => {
+    setSyncStatus("syncing");
+    await deleteRemoteState();
     setMatrix(makeEmptyMatrix());
     setNames([...DEFAULT_NAMES]);
     setSubmitted(Array(NUM_ROOMS).fill(false));
     setActivePerson(null);
     setResult(null);
+    setSyncStatus("ok");
     setPhase("landing");
   }, []);
 
+  // ── Render ──
   if (phase === "landing") {
-    return <Landing onStart={() => setPhase("choose")} />;
+    return <Landing onStart={handleStart} syncStatus={syncStatus} />;
   }
 
   if (phase === "choose") {
@@ -772,6 +931,7 @@ export default function RentDivider() {
         submitted={submitted}
         colValid={colValid}
         colSums={colSums}
+        syncStatus={syncStatus}
         onPick={handlePick}
         onRunAlgorithm={handleRunAlgorithm}
       />
@@ -783,12 +943,13 @@ export default function RentDivider() {
       <InputScreen
         person={activePerson}
         names={names}
-        setName={(name) => setNames((prev) => { const n = [...prev]; n[activePerson] = name; return n; })}
+        setName={handleSetName}
         matrix={matrix}
         setCell={(room, value) => setCell(room, activePerson, value)}
         submitted={submitted}
         colSums={colSums}
         colValid={colValid}
+        syncStatus={syncStatus}
         onSubmit={handleSubmit}
         onBack={handleBack}
       />
@@ -799,7 +960,15 @@ export default function RentDivider() {
     const valuations = Array.from({ length: NUM_ROOMS }, (_, person) =>
       Array.from({ length: NUM_ROOMS }, (_, room) => parseFloat(matrix[room][person]) || 0)
     );
-    return <ResultsScreen result={result} names={names} valuations={valuations} onReset={handleReset} />;
+    return (
+      <ResultsScreen
+        result={result}
+        names={names}
+        valuations={valuations}
+        syncStatus={syncStatus}
+        onReset={handleReset}
+      />
+    );
   }
 
   return null;
