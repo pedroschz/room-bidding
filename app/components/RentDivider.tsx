@@ -654,15 +654,56 @@ function ResultsScreen({ result, names, valuations, onReset }: ResultsScreenProp
   );
 }
 
+// ─── Persistence ──────────────────────────────────────────────────────────────
+
+const STORAGE_KEY = "rent-division-v1";
+
+interface PersistedState {
+  phase: Phase;
+  names: string[];
+  matrix: string[][];
+  submitted: boolean[];
+}
+
+function loadState(): PersistedState | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as PersistedState) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveState(s: PersistedState) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+  } catch {
+    // storage full or unavailable — fail silently
+  }
+}
+
+function clearState() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+}
+
 // ─── Root ─────────────────────────────────────────────────────────────────────
 
 export default function RentDivider() {
-  const [phase, setPhase] = useState<Phase>("landing");
-  const [names, setNames] = useState<string[]>([...DEFAULT_NAMES]);
-  const [matrix, setMatrix] = useState<string[][]>(makeEmptyMatrix());
-  const [submitted, setSubmitted] = useState<boolean[]>(Array(NUM_ROOMS).fill(false));
+  // Initialise from localStorage on first render; "landing" if nothing saved.
+  const [phase, setPhase] = useState<Phase>(() => loadState()?.phase ?? "landing");
+  const [names, setNames] = useState<string[]>(() => loadState()?.names ?? [...DEFAULT_NAMES]);
+  const [matrix, setMatrix] = useState<string[][]>(() => loadState()?.matrix ?? makeEmptyMatrix());
+  const [submitted, setSubmitted] = useState<boolean[]>(() => loadState()?.submitted ?? Array(NUM_ROOMS).fill(false));
   const [activePerson, setActivePerson] = useState<number | null>(null);
   const [result, setResult] = useState<AllocationResult | null>(null);
+
+  // Persist whenever relevant state changes (activePerson is ephemeral — always
+  // land on "choose" after a refresh, which is safe).
+  useEffect(() => {
+    const persistPhase: Phase = phase === "input" ? "choose" : phase;
+    saveState({ phase: persistPhase, names, matrix, submitted });
+  }, [phase, names, matrix, submitted]);
 
   const colSums = useMemo(
     () => Array.from({ length: NUM_ROOMS }, (_, p) => columnSum(matrix, p)),
@@ -711,6 +752,7 @@ export default function RentDivider() {
   }, [matrix]);
 
   const handleReset = useCallback(() => {
+    clearState();
     setMatrix(makeEmptyMatrix());
     setNames([...DEFAULT_NAMES]);
     setSubmitted(Array(NUM_ROOMS).fill(false));
